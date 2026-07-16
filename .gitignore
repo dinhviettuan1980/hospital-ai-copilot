@@ -1,0 +1,16 @@
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local environment / secrets (also gitignored per-module, kept here as a backstop)
+.env
+.env.local
+*.pem
+*.key
