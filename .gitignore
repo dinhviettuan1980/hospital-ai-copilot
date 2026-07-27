@@ -14,3 +14,8 @@ npm-debug.log*
 .env.local
 *.pem
 *.key
+
+# Python
+__pycache__/
+*.pyc
+
