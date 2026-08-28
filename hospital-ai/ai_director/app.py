@@ -19,7 +19,6 @@ app = FastAPI(title="Hospital AI Director - Weekly Report Q&A (prototype)")
 
 _groq_client = Groq(api_key=GROQ_API_KEY)
 _conn = get_conn()
-_schema_context = build_schema_context(_conn)
 
 
 def _reconnect_if_needed(fn):
@@ -71,8 +70,7 @@ TEST_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h1>AI Director - Hỏi đáp báo cáo tuần (thử nghiệm)</h1>
-  <div class="note">Dữ liệu mẫu từ 3 tuần: 20/04-26/04/2022, 09/07-15/07/2025, 03/06-09/06/2026. Trả lời có thể sai, đây là bản thử nghiệm.
-    &nbsp;·&nbsp; <a href="manage">Quản lý báo cáo (thêm / sửa / xoá)</a></div>
+  <div class="note" id="periodsNote">Đang tải danh sách báo cáo...</div>
   <div id="log"></div>
   <form id="f">
     <input id="q" type="text" placeholder="Hỏi gì đó, vd: tuần rồi bao nhiêu bệnh nhân ra viện?" autocomplete="off">
@@ -93,6 +91,25 @@ function addMsg(text, cls) {
   return div;
 }
 
+async function loadPeriodsNote() {
+  const el = document.getElementById('periodsNote');
+  try {
+    const rows = await (await fetch('reports')).json();
+    const labels = rows
+      .slice()
+      .sort((a, b) => a.start_date.localeCompare(b.start_date))
+      .map(r => r.label)
+      .join(', ');
+    el.textContent = rows.length
+      ? `Dữ liệu từ ${rows.length} tuần: ${labels}. Trả lời có thể sai, đây là bản thử nghiệm.`
+      : 'Chưa có báo cáo nào được nạp. Trả lời có thể sai, đây là bản thử nghiệm.';
+  } catch (err) {
+    el.textContent = 'Trả lời có thể sai, đây là bản thử nghiệm.';
+  }
+  el.insertAdjacentHTML('beforeend', ' · <a href="manage">Quản lý báo cáo (thêm / sửa / xoá)</a>');
+}
+loadPeriodsNote();
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const question = input.value.trim();
@@ -108,7 +125,7 @@ form.addEventListener('submit', async (e) => {
       body: JSON.stringify({ question })
     });
     const data = await res.json();
-    loadingEl.textContent = data.answer || ('Lỗi: ' + JSON.stringify(data));
+    loadingEl.textContent = res.ok ? data.answer : ('Lỗi: ' + (data.detail || JSON.stringify(data)));
     loadingEl.classList.remove('loading');
   } catch (err) {
     loadingEl.textContent = 'Lỗi kết nối: ' + err;
@@ -513,14 +530,20 @@ def health():
 
 @app.post("/ask")
 def ask_question(payload: Question):
-    global _conn
+    # Rebuilt fresh each call (cheap - 3 small SELECTs) rather than cached at
+    # startup, so newly uploaded/edited/deleted reports show up immediately
+    # instead of only after a server restart.
+    def do_ask(conn):
+        schema_context = build_schema_context(conn)
+        return ask(payload.question, conn, _groq_client, schema_context)
+
     try:
-        answer = ask(payload.question, _conn, _groq_client, _schema_context)
-    except Exception:
-        # Neon can drop idle connections; reconnect once and retry.
-        _conn.close()
-        _conn = get_conn()
-        answer = ask(payload.question, _conn, _groq_client, _schema_context)
+        answer = _reconnect_if_needed(do_ask)
+    except Exception as e:
+        msg = "AI đang quá tải hoặc hết hạn mức tạm thời, vui lòng thử lại sau ít phút."
+        if "rate_limit" not in str(e) and "429" not in str(e):
+            msg = f"Lỗi khi hỏi AI: {e}"
+        raise HTTPException(status_code=502, detail=msg)
     return {"answer": answer}
 
 
