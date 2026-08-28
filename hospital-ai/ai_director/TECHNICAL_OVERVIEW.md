@@ -49,7 +49,7 @@ Hai luồng chính:
 | Reverse proxy | **nginx** | `ksbvapi.tuandv.id.vn` → `location /ai-director/` → `proxy_pass http://127.0.0.1:8041/` |
 | LLM | **Groq API**, model `openai/gpt-oss-120b` | **Cả 2 việc**: (1) trả lời câu hỏi qua tool-calling, (2) trích xuất dữ liệu có cấu trúc từ file PowerPoint upload — xem chi tiết mục 5 |
 | Đọc file PowerPoint | **python-pptx** | Đọc text + bảng biểu từ file `.pptx` upload lên |
-| Database | **Postgres (Neon)** | Lưu toàn bộ dữ liệu báo cáo, truy cập qua **psycopg3** (`psycopg[binary]`) |
+| Database | **Postgres tự cài trên VPS** (không còn dùng Neon từ 28/08/2026) | Lưu toàn bộ dữ liệu báo cáo, truy cập qua **psycopg3** (`psycopg[binary]`) |
 | Frontend | **HTML/CSS/JS thuần** (không framework, không build step) | 2 trang: `/` (chat) và `/manage` (quản lý), render trực tiếp từ chuỗi Python trong `app.py` |
 
 Không dùng React/Vue, không dùng ORM, không dùng authentication — xem mục 8 (Giới hạn/rủi ro).
@@ -273,7 +273,7 @@ commit() -> trả {"id": report_id}
 
 ---
 
-## 9. Schema Database (Postgres/Neon)
+## 9. Schema Database (Postgres)
 
 ```
 report_period(id, label, start_date, end_date, source_file)
@@ -317,7 +317,7 @@ narrative_section(id, report_period_id, section_name, content)
 | Domain | `ksbvapi.tuandv.id.vn` (nginx, SSL Let's Encrypt) |
 | nginx routing | `/` → cổng `8040` (Java Quarkus `ksbvapi`, không liên quan) · `/ai-director/` → `proxy_pass http://127.0.0.1:8041/` (bỏ tiền tố path) |
 | nginx config đặc biệt cho `/ai-director/` | `client_max_body_size 30m;` (mặc định 1MB không đủ cho file .pptx) · `proxy_read/send/connect_timeout 280s;` (mặc định 60s không đủ cho trích xuất nhiều chunk) |
-| Database | Neon Postgres (serverless), connection string trong `.env` (`DATABASE_URL`) |
+| Database | Postgres 16 tự cài trên cùng VPS (database `ksbvai`, user `ksbvai_user`, bind `127.0.0.1:5432`) — trước 28/08/2026 dùng Neon, đã migrate về local để đồng bộ với các app khác trong hạ tầng. Connection string trong `.env` (`DATABASE_URL`) |
 | Deploy | `git push` → `ssh pc1@103.163.216.32 'bash ~/deploy-ksbv-ai.sh'` → script: `git pull` + `pip install -r requirements.txt` + `pm2 restart ksbv-ai` |
 | CI/CD tự động | **Không** — service này nằm ngoài cron auto-deploy 2 phút áp dụng cho các app khác trong hạ tầng, phải deploy tay bằng script trên |
 
@@ -333,7 +333,7 @@ narrative_section(id, report_period_id, section_name, content)
 - **Không versioning/audit log** cho sửa/xoá báo cáo — `UPDATE`/`DELETE` ghi đè trực tiếp, không giữ
   lịch sử bản cũ.
 - **1 kết nối Postgres dùng chung** (biến global `_conn` trong `app.py`) cho toàn bộ request, tự
-  reconnect khi Neon ngắt kết nối do idle — mô hình đơn giản, phù hợp lưu lượng thấp hiện tại nhưng
+  reconnect nếu kết nối bị đóng do idle — mô hình đơn giản, phù hợp lưu lượng thấp hiện tại nhưng
   không scale tốt nếu có nhiều request đồng thời.
 - **Gói Groq miễn phí giới hạn thấp** (mục 7) — nếu tần suất sử dụng tăng, nên cân nhắc nâng cấp lên
   Dev Tier trên Groq Console (quyết định thuộc về người quản lý tài khoản, không tự động hoá được).
