@@ -11,29 +11,66 @@ draft to create_report/update_report.
 """
 import io
 import json
+import re
+import time
 
 from pptx import Presentation
 
+# This Groq org's on-demand tier caps openai/gpt-oss-120b at 8000 tokens/minute,
+# which a single call covering both the metric table and the narrative text of a
+# real weekly deck (~30-50 slides) can exceed. Splitting extraction into a
+# table-focused call and a narrative-focused call keeps each request well under
+# that budget instead of truncating (and silently dropping) report content.
 MODEL = "openai/gpt-oss-120b"
 
 FACILITY_CODES = ("CS1", "CS2", "TOTAL")
 
+# Vietnamese text with lots of numbers/punctuation tokenizes at roughly
+# 2.2-2.3 chars/token (measured against this org's actual Groq responses),
+# not the ~4 chars/token rule of thumb for English. Char caps below are
+# sized conservatively off that ratio so (system prompt + input +
+# max_tokens reserved for the completion) stays under the 8000 TPM budget.
+METRICS_MAX_COMPLETION_TOKENS = 2200
+NARRATIVE_MAX_COMPLETION_TOKENS = 2400
+MAX_TABLE_CHARS = 9000
+MAX_NARRATIVE_CHARS = 9000
 
-def extract_text_from_pptx(file_bytes: bytes) -> str:
+
+# Some decks put qualitative content (praise/complaint logs, "góp ý" tables) in
+# an actual PowerPoint *table* rather than free text - if any of these appear
+# in a table's cells, route the whole table to the narrative stream instead of
+# the metrics stream, or it would silently be dropped (no metric_code matches
+# a praise/complaint row, so a metrics-only prompt just ignores it).
+_NARRATIVE_TABLE_KEYWORDS = (
+    "góp ý", "khen", "sự cố", "khiếu nại", "phản ánh",
+    "nguyên nhân và giải pháp", "được khen",
+)
+
+
+def extract_pptx_streams(file_bytes: bytes) -> tuple[str, str]:
+    """Split a pptx into (table_text, narrative_text) - numeric tables carry
+    the quantitative metrics, everything else (free text, and any table that
+    looks qualitative) carries title/incidents/feedback/narrative - so each
+    stream can be sent to Groq as a much smaller, focused prompt."""
     prs = Presentation(io.BytesIO(file_bytes))
-    lines = []
+    table_lines, narrative_lines = [], []
     for slide_idx, slide in enumerate(prs.slides, start=1):
-        lines.append(f"--- Slide {slide_idx} ---")
         for shape in slide.shapes:
             if shape.has_table:
-                for row in shape.table.rows:
-                    cells = [cell.text.strip() for cell in row.cells]
-                    lines.append(" | ".join(cells))
+                rows_text = [
+                    " | ".join(cell.text.strip() for cell in row.cells) for row in shape.table.rows
+                ]
+                joined = "\n".join(rows_text).lower()
+                is_narrative = any(kw in joined for kw in _NARRATIVE_TABLE_KEYWORDS)
+                target = narrative_lines if is_narrative else table_lines
+                target.append(f"--- Slide {slide_idx} ---")
+                target.extend(rows_text)
             elif shape.has_text_frame:
                 text = shape.text_frame.text.strip()
                 if text:
-                    lines.append(text)
-    return "\n".join(lines)
+                    narrative_lines.append(f"--- Slide {slide_idx} ---")
+                    narrative_lines.append(text)
+    return "\n".join(table_lines), "\n".join(narrative_lines)
 
 
 def load_metric_defs(conn):
@@ -42,64 +79,159 @@ def load_metric_defs(conn):
         return cur.fetchall()
 
 
-def _build_extraction_prompt(metric_defs) -> str:
-    metrics_txt = "\n".join(
-        f"  - {m['code']} [{m['category']}]: {m['name']} (đơn vị: {m['unit']})" for m in metric_defs
-    )
-    return f"""Bạn là bot trích xuất dữ liệu từ báo cáo giao ban tuần của bệnh viện. Người dùng sẽ đưa cho bạn
-nội dung text đã trích thô từ file PowerPoint (qua python-pptx, gồm cả nội dung bảng biểu). Nhiệm vụ của bạn
-là đọc và trả về DUY NHẤT một JSON object theo đúng schema sau, không thêm giải thích:
+def _build_metrics_prompt(metric_defs) -> str:
+    metrics_txt = "\n".join(f"{m['code']}={m['name']}({m['unit']})" for m in metric_defs)
+    return f"""Trích số liệu từ bảng báo cáo giao ban tuần bệnh viện. Trả về DUY NHẤT JSON, không giải thích:
+{{"metrics": {{"<metric_code>": {{"CS1": number|null, "CS2": number|null, "TOTAL": number|null, "note": string|null}}}}}}
 
-{{
+metric_code hợp lệ (bỏ qua số liệu không khớp code nào):
+{metrics_txt}
+
+Quy tắc quan trọng:
+- Dòng tổng (vd "...2 cơ sở") + 2 dòng con "Cơ sở 1"/"Cơ sở 2" ngay dưới -> dòng tổng=TOTAL, 2 dòng con=CS1/CS2.
+- Bảng có nhiều cột số liệu (TB tháng trước, tuần báo cáo, chênh lệch/%) -> CHỈ lấy cột khớp tên/khoảng ngày
+  tuần báo cáo, bỏ qua cột tháng trước và cột chênh lệch/%. Cột "tuần báo cáo" là cột có tiêu đề dạng
+  "Tuần DD/M->DD/M/YYYY" hoặc tương tự - đây LUÔN LÀ CỘT THỨ 2 trong nhóm 3 cột (tháng trước | tuần này |
+  chênh lệch), KHÔNG PHẢI cột đầu tiên.
+- VÍ DỤ CỤ THỂ: dòng dữ liệu "I. | Tổng số BN khám bệnh 2 cơ sở | 12.288 | 11.489 | 799" với tiêu đề cột
+  "T7/2026 | Tuần 19/8->25/8/2026 | Chênh lệch" -> giá trị ĐÚNG cần lấy là 11.489 (cột thứ 2, khớp tuần báo
+  cáo), TUYỆT ĐỐI KHÔNG lấy 12.288 (cột thứ 1, chỉ là số liệu trung bình tháng trước, không phải số của tuần
+  báo cáo này).
+- "12.288" = 12288 (dấu chấm là hàng nghìn kiểu VN, không phải thập phân).
+- Không chắc chắn -> để null, không bịa số (dữ liệu dùng cho Ban Giám đốc bệnh viện)."""
+
+
+_NARRATIVE_PROMPT = """Bạn là bot trích xuất dữ liệu định tính từ báo cáo giao ban tuần của bệnh viện.
+Người dùng sẽ đưa cho bạn nội dung text (tiêu đề, sự cố, khiếu nại/khen ngợi, tường thuật theo khoa/phòng)
+đã trích thô từ file PowerPoint. Đọc và trả về DUY NHẤT một JSON object theo đúng schema sau, không thêm
+giải thích:
+
+{
   "label": "Tuần DD/MM - DD/MM/YYYY",
   "start_date": "YYYY-MM-DD",
   "end_date": "YYYY-MM-DD",
-  "metrics": {{
-    "<metric_code>": {{"CS1": number|null, "CS2": number|null, "TOTAL": number|null, "note": string|null}}
-  }},
   "incidents": [
-    {{"department": string, "incident_date": string, "description": string, "cause": string,
-      "corrective_action": string, "resolved": boolean, "severity": "low"|"medium"|"high"}}
+    {"department": string, "incident_date": string, "description": string, "cause": string,
+      "corrective_action": string, "resolved": boolean, "severity": "low"|"medium"|"high"}
   ],
   "feedback": [
-    {{"date": string, "department": string, "type": "complaint"|"praise", "content": string,
-      "cause": string|null, "resolution": string|null}}
+    {"date": string, "department": string, "type": "complaint"|"praise", "content": string,
+      "cause": string|null, "resolution": string|null}
   ],
   "narrative_sections": [
-    {{"section_name": string, "content": string}}
+    {"section_name": string, "content": string}
   ]
-}}
+}
 
-DANH SÁCH metric_code HỢP LỆ (chỉ dùng đúng các code này, bỏ qua số liệu không khớp code nào):
-{metrics_txt}
-
-Cơ sở (facility) chỉ có 3 mã: CS1, CS2, TOTAL. Chỉ điền giá trị cho facility có số liệu thật trong nguồn,
-để null nếu không có (KHÔNG tự suy ra hay cộng trừ để bịa số). Nếu chỉ có TOTAL mà không tách CS1/CS2 thì
-chỉ điền TOTAL.
-
-QUAN TRỌNG: Nếu không chắc chắn hoặc không tìm thấy giá trị/thông tin nào, để null (metric) hoặc bỏ qua
-(incident/feedback/narrative) thay vì bịa ra. Đây là dữ liệu dùng cho Ban Giám đốc bệnh viện, sai số liệu
-là không chấp nhận được."""
+label/start_date/end_date thường lấy từ slide tiêu đề đầu báo cáo (dạng "Từ ngày DD/MM/YYYY đến DD/MM/YYYY").
+Nếu không chắc chắn hoặc không tìm thấy thông tin nào, bỏ qua thay vì bịa ra - đây là dữ liệu dùng cho
+Ban Giám đốc bệnh viện, sai lệch là không chấp nhận được."""
 
 
-def extract_report_data(raw_text: str, groq_client, conn) -> dict:
+def _chat_json(groq_client, system_prompt: str, user_content: str, max_tokens: int, retries: int = 1) -> dict:
+    for attempt in range(retries + 1):
+        try:
+            response = groq_client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens,
+                temperature=0.1,
+                reasoning_effort="low",
+            )
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("Groq trả về nội dung rỗng (có thể do hết token cho phần suy luận nội bộ)")
+            return json.loads(content)
+        except Exception as e:
+            msg = str(e)
+            # 429 = temporarily out of budget in the current rate-limit window, worth
+            # a short wait and retry. 413 means this single request's own size (prompt
+            # + max_tokens) permanently exceeds the tier's per-request cap - retrying
+            # the identical payload will never succeed, so fail fast instead.
+            if attempt < retries and "429" in msg and "413" not in msg:
+                time.sleep(20)
+                continue
+            raise
+
+
+# Hard ceiling on chunk count per stream, so a pathologically large deck fails
+# loudly (flagged as truncated) instead of firing dozens of sequential Groq
+# calls and taking many minutes.
+MAX_CHUNKS = 6
+
+
+def _chunk_by_slide(text: str, max_chars: int) -> tuple[list[str], bool]:
+    """Split text into <= max_chars pieces on slide boundaries (never mid-row),
+    so a large deck can be extracted across several smaller Groq calls instead
+    of truncating (and losing) the tail. Returns (chunks, was_capped)."""
+    if len(text) <= max_chars:
+        return ([text] if text.strip() else []), False
+    blocks = re.split(r"(?=--- Slide \d+ ---)", text)
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        if not block.strip():
+            continue
+        if current and len(current) + len(block) > max_chars:
+            chunks.append(current)
+            current = block
+        else:
+            current += block
+    if current:
+        chunks.append(current)
+    if len(chunks) > MAX_CHUNKS:
+        return chunks[:MAX_CHUNKS], True
+    return chunks, False
+
+
+def _merge_metrics(base: dict, addition: dict) -> dict:
+    for code, values in addition.items():
+        existing = base.get(code)
+        if existing is None or all(existing.get(f) is None for f in FACILITY_CODES):
+            base[code] = values
+    return base
+
+
+def extract_report_data(table_text: str, narrative_text: str, groq_client, conn) -> dict:
     metric_defs = load_metric_defs(conn)
-    system_prompt = _build_extraction_prompt(metric_defs)
-    response = groq_client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": raw_text[:100000]},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
-    data = json.loads(response.choices[0].message.content)
-    data.setdefault("metrics", {})
-    data.setdefault("incidents", [])
-    data.setdefault("feedback", [])
-    data.setdefault("narrative_sections", [])
-    return data
+    metrics_prompt = _build_metrics_prompt(metric_defs)
+
+    table_chunks, table_capped = _chunk_by_slide(table_text, MAX_TABLE_CHARS)
+    metrics: dict = {}
+    for i, chunk in enumerate(table_chunks):
+        chunk_result = _chat_json(groq_client, metrics_prompt, chunk, METRICS_MAX_COMPLETION_TOKENS)
+        _merge_metrics(metrics, chunk_result.get("metrics", {}))
+        if i < len(table_chunks) - 1:
+            time.sleep(8)  # let the per-minute token bucket refill before the next chunk
+
+    narrative_chunks, narrative_capped = _chunk_by_slide(narrative_text, MAX_NARRATIVE_CHARS)
+    label = start_date = end_date = ""
+    incidents, feedback, narrative_sections = [], [], []
+    for i, chunk in enumerate(narrative_chunks):
+        chunk_result = _chat_json(groq_client, _NARRATIVE_PROMPT, chunk, NARRATIVE_MAX_COMPLETION_TOKENS)
+        label = label or chunk_result.get("label") or ""
+        start_date = start_date or chunk_result.get("start_date") or ""
+        end_date = end_date or chunk_result.get("end_date") or ""
+        incidents.extend(chunk_result.get("incidents", []))
+        feedback.extend(chunk_result.get("feedback", []))
+        narrative_sections.extend(chunk_result.get("narrative_sections", []))
+        if i < len(narrative_chunks) - 1:
+            time.sleep(8)
+
+    return {
+        "label": label,
+        "start_date": start_date,
+        "end_date": end_date,
+        "metrics": metrics,
+        "incidents": incidents,
+        "feedback": feedback,
+        "narrative_sections": narrative_sections,
+        "truncated": {"table": table_capped, "narrative": narrative_capped},
+    }
 
 
 def _facility_ids(conn) -> dict:

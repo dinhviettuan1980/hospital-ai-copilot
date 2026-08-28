@@ -252,7 +252,7 @@ async function onFileChosen(input) {
   const file = input.files[0];
   input.value = '';
   if (!file) return;
-  showSpinner('Đang đọc file và trích xuất dữ liệu bằng AI (có thể mất 20-40 giây)...');
+  showSpinner('Đang đọc file và trích xuất dữ liệu bằng AI (báo cáo dài có thể mất 1-2 phút, do dữ liệu được xử lý theo từng phần)...');
   try {
     const fd = new FormData();
     fd.append('file', file);
@@ -304,10 +304,16 @@ function renderEditForm(draft) {
     </div>
   `;
 
+  const banners = [];
   const overlaps = draft.overlaps || [];
   if (overlaps.length) {
-    document.getElementById('editBanner').innerHTML =
-      `<div class="banner">⚠️ Đã có báo cáo trùng khoảng ngày này trong hệ thống: ${overlaps.map(o => esc(o.label)).join(', ')}. Kiểm tra kỹ trước khi lưu để tránh trùng dữ liệu.</div>`;
+    banners.push(`⚠️ Đã có báo cáo trùng khoảng ngày này trong hệ thống: ${overlaps.map(o => esc(o.label)).join(', ')}. Kiểm tra kỹ trước khi lưu để tránh trùng dữ liệu.`);
+  }
+  const truncated = draft.truncated || {};
+  if (truncated.table) banners.push('⚠️ Nội dung bảng số liệu trong file quá dài, đã bị cắt bớt khi trích xuất - kiểm tra kỹ phần số liệu bên dưới, có thể thiếu.');
+  if (truncated.narrative) banners.push('⚠️ Nội dung tường thuật/sự cố/khiếu nại trong file quá dài, đã bị cắt bớt khi trích xuất - có thể thiếu mục.');
+  if (banners.length) {
+    document.getElementById('editBanner').innerHTML = banners.map(b => `<div class="banner">${b}</div>`).join('');
   }
 
   let byCat = {};
@@ -518,16 +524,19 @@ async def extract_report_route(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file .ppt/.pptx")
     file_bytes = await file.read()
     try:
-        raw_text = reports_svc.extract_text_from_pptx(file_bytes)
+        table_text, narrative_text = reports_svc.extract_pptx_streams(file_bytes)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Không đọc được file PowerPoint: {e}")
-    if not raw_text.strip():
+    if not table_text.strip() and not narrative_text.strip():
         raise HTTPException(status_code=400, detail="File không có nội dung text để trích xuất")
 
     def do_extract(conn):
-        return reports_svc.extract_report_data(raw_text, _groq_client, conn)
+        return reports_svc.extract_report_data(table_text, narrative_text, _groq_client, conn)
 
-    draft = _reconnect_if_needed(do_extract)
+    try:
+        draft = _reconnect_if_needed(do_extract)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Lỗi khi gọi AI trích xuất dữ liệu: {e}")
     draft["source_file"] = file.filename
     draft["overlaps"] = _reconnect_if_needed(
         lambda c: reports_svc.find_overlapping_reports(c, draft["start_date"], draft["end_date"])
