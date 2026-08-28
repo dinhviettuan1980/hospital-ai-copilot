@@ -152,7 +152,11 @@ MANAGE_PAGE = """<!DOCTYPE html>
   .top-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
   .form-actions { position: sticky; bottom: 0; background: #f6f7f9; padding: 12px 0; display: flex; gap: 8px; border-top: 1px solid #ddd; margin-top: 16px; }
   .banner { background: #fff7ed; border: 1px solid #fdba74; color: #9a3412; padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
-  .spinner { padding: 40px; text-align: center; color: #666; }
+  .spinner { padding: 60px 20px; text-align: center; color: #666; }
+  .spinner-icon { width: 36px; height: 36px; margin: 0 auto 16px; border-radius: 50%; border: 4px solid #dbeafe; border-top-color: #2563eb; animation: spin 0.8s linear infinite; }
+  .spinner-msg { font-size: 14px; max-width: 480px; margin: 0 auto; line-height: 1.5; }
+  .spinner-elapsed { margin-top: 10px; font-size: 12px; color: #999; font-variant-numeric: tabular-nums; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   #fileInput { display: none; }
   .head-grid { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 8px; margin-bottom: 12px; }
 </style>
@@ -235,9 +239,16 @@ async function loadList() {
 }
 
 function showList() {
+  stopSpinner();
   document.getElementById('listView').style.display = '';
   document.getElementById('listActions').style.display = '';
   document.getElementById('editView').style.display = 'none';
+}
+
+let spinnerTimer = null;
+
+function stopSpinner() {
+  if (spinnerTimer) { clearInterval(spinnerTimer); spinnerTimer = null; }
 }
 
 function showSpinner(msg) {
@@ -245,7 +256,19 @@ function showSpinner(msg) {
   document.getElementById('listActions').style.display = 'none';
   document.getElementById('editView').style.display = '';
   document.getElementById('editBanner').innerHTML = '';
-  document.getElementById('editView').innerHTML = `<div class="spinner">${esc(msg)}</div>`;
+  stopSpinner();
+  document.getElementById('editView').innerHTML = `
+    <div class="spinner">
+      <div class="spinner-icon"></div>
+      <div class="spinner-msg">${esc(msg)}</div>
+      <div class="spinner-elapsed" id="spinnerElapsed">Đã chờ 0 giây...</div>
+    </div>`;
+  const startedAt = Date.now();
+  spinnerTimer = setInterval(() => {
+    const el = document.getElementById('spinnerElapsed');
+    if (!el) { stopSpinner(); return; }
+    el.textContent = `Đã chờ ${Math.floor((Date.now() - startedAt) / 1000)} giây...`;
+  }, 500);
 }
 
 async function onFileChosen(input) {
@@ -282,6 +305,7 @@ async function openEdit(id) {
 }
 
 function renderEditForm(draft) {
+  stopSpinner();
   document.getElementById('editView').innerHTML = `
     <div id="editBanner"></div>
     <div class="head-grid">
