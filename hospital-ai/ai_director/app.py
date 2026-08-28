@@ -5,6 +5,7 @@ Also serves a minimal test chat page at GET / for manual browser testing.
 
 Run: uvicorn ai_director.app:app --host 127.0.0.1 --port 8041
 """
+import re
 from typing import Any, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -30,6 +31,18 @@ def _reconnect_if_needed(fn):
         _conn.close()
         _conn = get_conn()
         return fn(_conn)
+
+
+def _friendly_groq_error(e: Exception, fallback_prefix: str) -> str:
+    msg = str(e)
+    if "rate_limit" in msg or "429" in msg:
+        wait_match = re.search(r"try again in ([\d.]+)(m|s)([\d.]+)?s?", msg)
+        if wait_match:
+            unit = "phút" if wait_match.group(2) == "m" else "giây"
+            wait = f"~{round(float(wait_match.group(1)))} {unit}"
+            return f"AI đã dùng hết hạn mức xử lý cho hôm nay/phút này, vui lòng thử lại sau {wait}."
+        return "AI đang quá tải hoặc hết hạn mức tạm thời, vui lòng thử lại sau ít phút."
+    return f"{fallback_prefix}: {e}"
 
 
 class Question(BaseModel):
@@ -540,10 +553,7 @@ def ask_question(payload: Question):
     try:
         answer = _reconnect_if_needed(do_ask)
     except Exception as e:
-        msg = "AI đang quá tải hoặc hết hạn mức tạm thời, vui lòng thử lại sau ít phút."
-        if "rate_limit" not in str(e) and "429" not in str(e):
-            msg = f"Lỗi khi hỏi AI: {e}"
-        raise HTTPException(status_code=502, detail=msg)
+        raise HTTPException(status_code=502, detail=_friendly_groq_error(e, "Lỗi khi hỏi AI"))
     return {"answer": answer}
 
 
@@ -583,7 +593,7 @@ async def extract_report_route(file: UploadFile = File(...)):
     try:
         draft = _reconnect_if_needed(do_extract)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Lỗi khi gọi AI trích xuất dữ liệu: {e}")
+        raise HTTPException(status_code=502, detail=_friendly_groq_error(e, "Lỗi khi gọi AI trích xuất dữ liệu"))
     draft["source_file"] = file.filename
     draft["overlaps"] = _reconnect_if_needed(
         lambda c: reports_svc.find_overlapping_reports(c, draft["start_date"], draft["end_date"])
